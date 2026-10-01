@@ -4,7 +4,7 @@ Copilot Gateway adalah reverse proxy API ringan berbasis FastAPI yang meneruskan
 
 Gateway ini menggunakan otentikasi **GitHub OAuth Device Flow**, sehingga Anda dapat menggunakan akun GitHub (seperti **GitHub Student Developer Pack** atau GitHub Copilot biasa) **tanpa perlu API Key Copilot berbayar**.
 
-Gateway ini siap dihubungkan sebagai **Custom Provider** pada platform gateway/router LLM seperti **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)**, baik secara lokal melalui **Custom Docker Network** maupun diakses dari internet menggunakan **Cloudflare Tunnel**.
+Gateway ini siap dihubungkan sebagai **Custom Provider** pada platform gateway/router LLM seperti **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)**, baik secara lokal melalui **External Docker Network** maupun diakses dari internet menggunakan **Cloudflare Tunnel**.
 
 Repository Link: `github.com/moccalatte/copilot-gateway`
 
@@ -15,7 +15,7 @@ Repository Link: `github.com/moccalatte/copilot-gateway`
 - **Model Focus**: Khusus meneruskan request ke model **`gpt-5.4-nano`** GitHub Copilot.
 - **GitHub Student / OAuth Flow**: Cukup login dengan akun GitHub Copilot Anda via OAuth device code, tanpa memerlukan API key Copilot.
 - **Persistent Token Storage**: Token hasil OAuth tersimpan di direktori `./data/tokens.json` secara persisten (aman saat container direstart).
-- **Custom Docker Network**: Dilengkapi kustom jaringan Docker (`copilot-net`) agar container OmniRoute, Cloudflared, atau service lain dapat terhubung langsung antar-container.
+- **External Docker Network**: Menggunakan eksternal jaringan Docker (`copilot-net`) agar container OmniRoute, Cloudflared, atau service lain dapat terhubung langsung antar-container.
 - **OmniRoute Compatible**: Kompatibel penuh dengan endpoint OpenAI (`/v1/chat/completions` dan `/v1/models`).
 - **Cloudflare Tunnel Friendly**: Panduan lengkap ekspos endpoint publik dengan SSL gratis via Cloudflare Tunnel (`https://copilot.domainkamu.com/v1`).
 - **Docker & Docker Compose Ready**: Dilengkapi Dockerfile dan docker-compose.yml yang mudah dijalankan.
@@ -45,7 +45,17 @@ cd copilot-gateway
 
 ---
 
-### Langkah 2: Konfigurasi File Environment `.env`
+### Langkah 2: Buat External Docker Network (`copilot-net`)
+
+Karena `docker-compose.yml` menggunakan jaringan eksternal `copilot-net`, Anda perlu membuat jaringannya terlebih dahulu (hanya 1 kali):
+
+```bash
+docker network create copilot-net
+```
+
+---
+
+### Langkah 3: Konfigurasi File Environment `.env`
 
 Salin file contoh `env.example` menjadi `.env`:
 
@@ -65,7 +75,7 @@ DATA_DIR=data
 
 ---
 
-### Langkah 3: Jalankan Service dengan Docker Compose (Custom Network)
+### Langkah 4: Jalankan Service dengan Docker Compose
 
 Jalankan perintah berikut di dalam folder `copilot-gateway`:
 
@@ -73,11 +83,11 @@ Jalankan perintah berikut di dalam folder `copilot-gateway`:
 docker-compose up -d
 ```
 
-*Perintah di atas akan membuat kustom network `copilot-net`, mendownload, dan menjalankan Copilot Gateway secara background.*
+*Perintah di atas akan mendownload dan menjalankan Copilot Gateway secara background di dalam jaringan `copilot-net`.*
 
 ---
 
-### Langkah 4: Login dengan Akun GitHub Copilot / Student Anda
+### Langkah 5: Login dengan Akun GitHub Copilot / Student Anda
 
 Gateway memerlukan izin dari akun GitHub Anda satu kali saja:
 
@@ -100,9 +110,9 @@ Gateway memerlukan izin dari akun GitHub Anda satu kali saja:
 
 ---
 
-## 🌐 Panduan Custom Docker Network
+## 🌐 Panduan External Docker Network
 
-File `docker-compose.yml` otomatis membuat kustom bridge network bernama **`copilot-net`**:
+`docker-compose.yml` dikonfigurasi menggunakan external network `copilot-net`:
 
 ```yaml
 version: '3.8'
@@ -127,11 +137,10 @@ services:
 
 networks:
   copilot-net:
-    name: copilot-net
-    driver: bridge
+    external: true
 ```
 
-Jika container lain (seperti container **OmniRoute** atau container **Cloudflared** terpisah) ingin berkomunikasi secara langsung dengan Copilot Gateway, Anda cukup menghubungkan container tersebut ke jaringan `copilot-net`:
+Dengan external network ini, container lain (seperti container **OmniRoute** atau container **Cloudflared** terpisah) dapat langsung dihubungkan ke jaringan `copilot-net` yang sama:
 
 ```bash
 # Hubungkan container OmniRoute
@@ -191,7 +200,7 @@ Untuk menghubungkan Copilot Gateway ini ke **OmniRoute**:
 4. Isi form berikut:
    - **Provider Name**: `Copilot Gateway`
    - **Base URL**:
-     - Jika menggunakan Custom Docker Network (`copilot-net`):
+     - Jika menggunakan External Docker Network (`copilot-net`):
        `http://copilot-gateway:8787/v1`
      - Jika menggunakan Cloudflare Tunnel:
        `https://copilot.domainkamu.com/v1`

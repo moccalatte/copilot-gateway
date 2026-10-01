@@ -20,5 +20,4 @@ services:
 
 networks:
   copilot-net:
-    name: copilot-net
-    driver: bridge
+    external: true
