@@ -135,3 +135,91 @@ def test_extract_delta_responses_api_events():
 def test_extract_delta_chat_chunk():
     chunk = {"choices": [{"index": 0, "delta": {"content": "abc"}, "finish_reason": None}]}
     assert server.extract_delta_from_copilot_json(chunk) == "abc"
+
+def test_transform_passes_tools_through():
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+    out = server.transform_request_body({
+        "model": "x", "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools, "tool_choice": "auto",
+    })
+    assert out["tools"] == [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+    assert out["tool_choice"] == "auto"
+
+def test_transform_without_tools_omits_keys():
+    out = server.transform_request_body({"model": "x", "messages": [{"role": "user", "content": "hi"}]})
+    assert "tools" not in out
+    assert "tool_choice" not in out
+
+def test_transform_converts_nested_tools_to_flat():
+    out = server.transform_request_body({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather", "description": "d", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+    })
+    assert out["tools"] == [{"type": "function", "name": "get_weather", "description": "d", "parameters": {"type": "object"}}]
+    assert out["tool_choice"] == "auto"
+
+def test_transform_tool_result_binds_function_call_output():
+    out = server.transform_request_body({
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Weather in Jakarta?"},
+            {"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Jakarta\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "30C sunny"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+    })
+    inp = out["input"]
+    assert isinstance(inp, list)
+    assert inp[0] == {"role": "user", "content": "System: Be terse.\nUser: Weather in Jakarta?"}
+    assert inp[1] == {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Jakarta\"}"}
+    assert inp[2] == {"type": "function_call_output", "call_id": "call_1", "output": "30C sunny"}
+
+def test_function_call_items_and_conversion():
+    raw = {
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "function_call", "call_id": "call_abc", "name": "get_weather", "arguments": "{\"city\": \"Jakarta\"}"},
+            {"type": "message", "content": [{"type": "output_text", "text": "Checking."}]},
+        ]
+    }
+    items = server._function_call_items(raw)
+    assert len(items) == 1
+    calls = server._to_openai_tool_calls(items)
+    assert calls[0]["id"] == "call_abc"
+    assert calls[0]["type"] == "function"
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert calls[0]["function"]["arguments"] == "{\"city\": \"Jakarta\"}"
+
+def test_completion_response_with_tool_calls():
+    resp = server.format_openai_completion_response(None, [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}])
+    assert resp["choices"][0]["finish_reason"] == "tool_calls"
+    assert resp["choices"][0]["message"]["tool_calls"][0]["id"] == "c1"
+
+def test_completion_response_plain_stop():
+    resp = server.format_openai_completion_response("hello")
+    assert resp["choices"][0]["finish_reason"] == "stop"
+    assert "tool_calls" not in resp["choices"][0]["message"]
+
+def test_chunks_from_sse_tool_events():
+    added = server.chunks_from_sse_payload({
+        "type": "response.output_item.added",
+        "output_item": {"type": "function_call", "call_id": "call_x", "name": "get_weather"},
+    })
+    assert added == [{"tool_delta": {"index": 0, "type": "function", "id": "call_x", "function": {"name": "get_weather", "arguments": ""}}}]
+    args = server.chunks_from_sse_payload({"type": "response.function_call_arguments.delta", "delta": "{\"city\":"})
+    assert args == [{"tool_delta": {"index": 0, "function": {"arguments": "{\"city\":"}}}]
+    # text delta still works through the same translator
+    txt = server.chunks_from_sse_payload({"type": "response.output_text.delta", "delta": "Hi"})
+    assert txt == [{"text": "Hi"}]
+    # ignorable events produce nothing
+    assert server.chunks_from_sse_payload({"type": "response.created"}) == []
+
+def test_chunk_sse_tool_call_format():
+    raw = server.format_openai_chunk_sse("", "req1", extra_delta={"tool_calls": [{"index": 0, "type": "function", "id": "c1", "function": {"name": "f", "arguments": "{}"}}]})
+    data = json.loads(raw.decode().removeprefix("data: ").strip())
+    assert data["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "f"
+    fin = json.loads(server.format_openai_chunk_sse("", "req1", finish_reason="stop").decode().removeprefix("data: ").strip())
+    assert fin["choices"][0]["finish_reason"] == "stop"

@@ -246,6 +246,26 @@ def transform_request_body(body: dict) -> dict:
     if "top_p" in body and isinstance(body["top_p"], (int, float)):
         new_body["top_p"] = float(body["top_p"])
 
+    # 1b. Pass tool-calling through. Harnesses send OpenAI chat-completions
+    # style tools ({"type":"function","function":{...}}) but the upstream
+    # /responses API requires the flat Responses format
+    # ({"type":"function","name":...}) and rejects the nested one with 400.
+    if isinstance(body.get("tools"), list) and body["tools"]:
+        converted = []
+        for tool in body["tools"]:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                flat = dict(tool["function"])
+                flat["type"] = "function"
+                converted.append(flat)
+            else:
+                converted.append(tool)
+        if converted:
+            new_body["tools"] = converted
+    if body.get("tool_choice") is not None:
+        new_body["tool_choice"] = body["tool_choice"]
+
     # 2. Extract string prompt input
     if "input" in body and isinstance(body["input"], str):
         new_body["input"] = body["input"]
@@ -253,10 +273,20 @@ def transform_request_body(body: dict) -> dict:
         messages = body.get("messages", [])
         if isinstance(messages, list) and len(messages) > 0:
             prompt_parts = []
+            input_items = []  # Responses API items (function_call(+_output))
             for m in messages:
                 if not isinstance(m, dict):
                     continue
                 role = str(m.get("role", "user"))
+
+                if role == "tool":
+                    input_items.append({
+                        "type": "function_call_output",
+                        "call_id": m.get("tool_call_id", ""),
+                        "output": m.get("content") if isinstance(m.get("content"), str) else str(m.get("content", "")),
+                    })
+                    continue
+
                 content = m.get("content", "")
                 if isinstance(content, list):
                     parts = []
@@ -269,9 +299,33 @@ def transform_request_body(body: dict) -> dict:
                 elif not isinstance(content, str):
                     content = str(content)
 
+                if role == "assistant" and isinstance(m.get("tool_calls"), list) and m["tool_calls"]:
+                    # Re-create the function_call items so upstream can bind
+                    # each following tool result to its call by id.
+                    for tc in m["tool_calls"]:
+                        if isinstance(tc, dict):
+                            fn = tc.get("function") or {}
+                            args = fn.get("arguments")
+                            input_items.append({
+                                "type": "function_call",
+                                "call_id": tc.get("id") or f"call_{secrets.token_hex(8)}",
+                                "name": fn.get("name", ""),
+                                "arguments": args if isinstance(args, str) else json.dumps(args or {}),
+                            })
+                    continue
+
                 prompt_parts.append(f"{role.capitalize()}: {content}")
 
-            if len(messages) == 1 and messages[0].get("role") == "user":
+            if input_items:
+                # Multi-turn tool conversation: rebuild a Responses API input
+                # list so results bind back to their function calls by id.
+                # Preceding context (system/user turns) goes as a plain text
+                # item first so the model keeps the original instruction.
+                prior = "\n".join(prompt_parts).strip()
+                if prior:
+                    input_items.insert(0, {"role": "user", "content": prior})
+                new_body["input"] = input_items
+            elif len(messages) == 1 and messages[0].get("role") == "user":
                 single_content = messages[0].get("content", "")
                 if isinstance(single_content, str):
                     new_body["input"] = single_content
@@ -417,8 +471,37 @@ def extract_delta_from_copilot_json(data: dict) -> str:
     return ""
 
 
-def format_openai_completion_response(text: str) -> dict:
+def _function_call_items(data: dict) -> list:
+    """Return Responses API function_call items from an upstream response."""
+    calls = []
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                calls.append(item)
+    return calls
+
+
+def _to_openai_tool_calls(items: list) -> list:
+    """Convert Responses API function_call items to OpenAI tool_calls."""
+    calls = []
+    for item in items:
+        args = item.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args if args is not None else {})
+        calls.append({
+            "id": item.get("call_id") or item.get("id") or f"call_{secrets.token_hex(8)}",
+            "type": "function",
+            "function": {"name": item.get("name", ""), "arguments": args},
+        })
+    return calls
+
+
+def format_openai_completion_response(text: str, tool_calls: list | None = None) -> dict:
     """Construct standard OpenAI chat completion JSON response."""
+    message = {"role": "assistant", "content": text}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": f"chatcmpl-{secrets.token_hex(12)}",
         "object": "chat.completion",
@@ -427,11 +510,8 @@ def format_openai_completion_response(text: str) -> dict:
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                },
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {
@@ -442,8 +522,75 @@ def format_openai_completion_response(text: str) -> dict:
     }
 
 
-def format_openai_chunk_sse(text: str, req_id: str) -> bytes:
+def chunks_from_sse_payload(payload: dict) -> list:
+    """Translate one upstream SSE JSON payload into OpenAI chunk deltas.
+
+    Returns a list of ``{"text": ...}`` / ``{"tool_delta": ...}`` dicts.
+    Events with no incremental output (response.created, .completed,
+    .done, .output_text.done, ...) yield nothing.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    t = payload.get("type")
+
+    if t == "response.output_text.delta":
+        delta = payload.get("delta")
+        text = delta if isinstance(delta, str) else _content_parts_to_text(delta)
+        return [{"text": text}] if text else []
+
+    if t == "response.output_item.added":
+        item = payload.get("output_item") or payload.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            call_id = (
+                item.get("call_id")
+                or item.get("id")
+                or f"call_{secrets.token_hex(8)}"
+            )
+            return [{
+                "tool_delta": {
+                    "index": 0,
+                    "type": "function",
+                    "id": call_id,
+                    "function": {"name": item.get("name", ""), "arguments": ""},
+                }
+            }]
+        return []
+
+    if t == "response.function_call_arguments.delta":
+        d = payload.get("delta")
+        if isinstance(d, str) and d:
+            return [{"tool_delta": {"index": 0, "function": {"arguments": d}}}]
+        return []
+
+    if t == "response.failed":
+        response = payload.get("response") or {}
+        error = response.get("error") or {}
+        msg = error.get("message") if isinstance(error, dict) else str(error)
+        return [{"text": f"Error: {msg or 'unknown upstream error'}"}]
+
+    if t == "error":
+        err = payload.get("error")
+        msg = payload.get("message") or (
+            err.get("message") if isinstance(err, dict) else None
+        )
+        return [{"text": f"Error: {msg or 'unknown upstream error'}"}]
+
+    return []
+
+
+def format_openai_chunk_sse(
+    text: str,
+    req_id: str,
+    finish_reason: str | None = None,
+    extra_delta: dict | None = None,
+) -> bytes:
     """Format an SSE data line in standard OpenAI chat completion chunk format."""
+    delta = {}
+    if text:
+        delta["content"] = text
+    if extra_delta:
+        delta.update(extra_delta)
     chunk = {
         "id": req_id,
         "object": "chat.completion.chunk",
@@ -452,8 +599,8 @@ def format_openai_chunk_sse(text: str, req_id: str) -> bytes:
         "choices": [
             {
                 "index": 0,
-                "delta": {"content": text},
-                "finish_reason": None,
+                "delta": delta,
+                "finish_reason": finish_reason,
             }
         ],
     }
@@ -573,13 +720,18 @@ async def responses(
                                         break
                                     try:
                                         payload = json.loads(payload_str)
-                                        extracted = extract_delta_from_copilot_json(payload)
-                                        if extracted:
-                                            yield format_openai_chunk_sse(extracted, req_id)
+                                        for piece in chunks_from_sse_payload(payload):
+                                            if "tool_delta" in piece:
+                                                yield format_openai_chunk_sse(
+                                                    "", req_id, extra_delta={"tool_calls": [piece["tool_delta"]]}
+                                                )
+                                            else:
+                                                yield format_openai_chunk_sse(piece.get("text", ""), req_id)
                                     except json.JSONDecodeError:
                                         if payload_str:
                                             yield format_openai_chunk_sse(payload_str, req_id)
 
+                            yield format_openai_chunk_sse("", req_id, finish_reason="stop")
                             yield b"data: [DONE]\n\n"
                             return
 
@@ -603,13 +755,18 @@ async def responses(
                                 break
                             try:
                                 payload = json.loads(payload_str)
-                                extracted = extract_delta_from_copilot_json(payload)
-                                if extracted:
-                                    yield format_openai_chunk_sse(extracted, req_id)
+                                for piece in chunks_from_sse_payload(payload):
+                                    if "tool_delta" in piece:
+                                        yield format_openai_chunk_sse(
+                                            "", req_id, extra_delta={"tool_calls": [piece["tool_delta"]]}
+                                        )
+                                    else:
+                                        yield format_openai_chunk_sse(piece.get("text", ""), req_id)
                             except json.JSONDecodeError:
                                 if payload_str:
                                     yield format_openai_chunk_sse(payload_str, req_id)
 
+                    yield format_openai_chunk_sse("", req_id, finish_reason="stop")
                     yield b"data: [DONE]\n\n"
 
             except httpx.TimeoutException:
@@ -663,8 +820,12 @@ async def responses(
 
             try:
                 raw_json = r.json()
+                fc_items = _function_call_items(raw_json)
+                tool_calls = _to_openai_tool_calls(fc_items)
                 text = extract_text_from_copilot_json(raw_json)
-                response_json = format_openai_completion_response(text)
+                if tool_calls:
+                    text = text or None
+                response_json = format_openai_completion_response(text, tool_calls or None)
             except ValueError:
                 response_json = format_openai_completion_response(r.text)
 
