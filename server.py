@@ -7,8 +7,8 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 
 load_dotenv()
 
@@ -16,10 +16,10 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------
 
-GITHUB_CLIENT_ID = os.environ["GITHUB_CLIENT_ID"]
-GATEWAY_API_KEY = os.environ["GATEWAY_API_KEY"]
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "Iv1.b507a08c87ecfe98")
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "change-this-to-a-long-random-secret")
 
-HOST = os.getenv("HOST", "127.0.0.1")
+HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8787"))
 
 MODEL = "gpt-5.4-nano"
@@ -29,13 +29,21 @@ GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
 COPILOT_RESPONSES_URL = "https://api.githubcopilot.com/responses"
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 TOKEN_FILE = DATA_DIR / "tokens.json"
 
 CONNECT_TIMEOUT = 15
 REQUEST_TIMEOUT = 120
 
 app = FastAPI(title="Copilot Gateway")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------
@@ -53,7 +61,7 @@ def load_tokens():
 
 
 def save_tokens(tokens):
-    DATA_DIR.mkdir(mode=0o700, exist_ok=True)
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     tmp = TOKEN_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(tokens))
@@ -221,22 +229,45 @@ def copilot_headers(token):
 
 
 # ---------------------------------------------------------
-# Health
+# Health & Models
 # ---------------------------------------------------------
 
 @app.get("/health")
 async def health():
+    tokens = load_tokens()
+    authenticated = bool(tokens.get("github_access_token"))
     return {
         "ok": True,
         "provider": "github-copilot",
+        "authenticated": authenticated,
         "model": MODEL,
     }
 
 
+@app.get("/v1/models")
+async def list_models(
+    authorization: str | None = Header(default=None),
+):
+    authenticate(authorization)
+
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": MODEL,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "github-copilot",
+            }
+        ],
+    }
+
+
 # ---------------------------------------------------------
-# Responses API
+# Responses / Chat Completions API
 # ---------------------------------------------------------
 
+@app.post("/v1/chat/completions")
 @app.post("/v1/responses")
 async def responses(
     request: Request,
@@ -246,7 +277,7 @@ async def responses(
 
     body = await request.json()
 
-    # Single-purpose gateway.
+    # Single-purpose gateway for gpt-5.4-nano via GitHub OAuth / Copilot.
     body["model"] = MODEL
 
     stream_mode = bool(body.get("stream", False))
@@ -312,8 +343,7 @@ async def responses(
             except httpx.TimeoutException:
                 yield b'{"error":{"message":"Upstream timeout"}}'
 
-            except httpx.HTTPError as exc:
-                safe = str(exc).replace("\n", " ")
+            except httpx.HTTPError:
                 yield (
                     b'{"error":{"message":"Upstream connection error"}}'
                 )
