@@ -33,7 +33,7 @@ COPILOT_RESPONSES_URL = "https://api.githubcopilot.com/responses"
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 TOKEN_FILE = DATA_DIR / "tokens.json"
 
-CONNECT_TIMEOUT = 15
+CONNECT_TIMEOUT = 30
 REQUEST_TIMEOUT = 120
 
 app = FastAPI(title="Copilot Gateway")
@@ -734,7 +734,7 @@ async def responses(
         connect=CONNECT_TIMEOUT,
         read=None if stream_mode else REQUEST_TIMEOUT,
         write=30,
-        pool=15,
+        pool=32,
     )
 
     req_id = f"chatcmpl-{secrets.token_hex(12)}"
@@ -833,8 +833,48 @@ async def responses(
                     yield b"data: [DONE]\n\n"
 
             except httpx.TimeoutException:
-                yield format_openai_chunk_sse("[Upstream timeout]", req_id)
-                yield b"data: [DONE]\n\n"
+                # One clean retry: transient connect/pool timeouts under bursty
+                # parallel agent calls should not poison the conversation with
+                # error text (Hermes keeps resending that text forever).
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client2:
+                        async with client2.stream(
+                            "POST",
+                            COPILOT_RESPONSES_URL,
+                            headers=headers,
+                            json=body,
+                        ) as retry_up:
+                            if retry_up.status_code >= 400:
+                                detail = await retry_up.aread()
+                                yield format_openai_chunk_sse(
+                                    f"[Upstream error {retry_up.status_code}]",
+                                    req_id,
+                                )
+                                yield b"data: [DONE]\n\n"
+                                return
+                            async for line in retry_up.aiter_lines():
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                payload_str = line[6:].strip()
+                                if payload_str == "[DONE]":
+                                    break
+                                try:
+                                    payload = json.loads(payload_str)
+                                    for piece in chunks_from_sse_payload(payload):
+                                        if "tool_delta" in piece:
+                                            yield format_openai_chunk_sse(
+                                                "", req_id, extra_delta={"tool_calls": [piece["tool_delta"]]}
+                                            )
+                                        else:
+                                            yield format_openai_chunk_sse(piece.get("text", ""), req_id)
+                                except json.JSONDecodeError:
+                                    if payload_str:
+                                        yield format_openai_chunk_sse(payload_str, req_id)
+                    yield format_openai_chunk_sse("", req_id, finish_reason="stop")
+                    yield b"data: [DONE]\n\n"
+                except Exception:
+                    yield format_openai_chunk_sse("[Upstream timeout]", req_id)
+                    yield b"data: [DONE]\n\n"
 
             except httpx.HTTPError:
                 yield format_openai_chunk_sse("[Upstream connection error]", req_id)
