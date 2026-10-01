@@ -235,23 +235,40 @@ def copilot_headers(token):
 
 def transform_request_body(body: dict) -> dict:
     """Transform OpenAI format body to Copilot /responses API format."""
-    new_body = dict(body)
-    new_body["model"] = MODEL
+    new_body = {}
 
-    if "input" not in new_body or not isinstance(new_body["input"], str):
-        messages = new_body.get("messages", [])
-        if messages and isinstance(messages, list):
+    # 1. Model & Parameters
+    new_body["model"] = MODEL
+    if "stream" in body:
+        new_body["stream"] = bool(body["stream"])
+    if "temperature" in body and isinstance(body["temperature"], (int, float)):
+        new_body["temperature"] = float(body["temperature"])
+    if "top_p" in body and isinstance(body["top_p"], (int, float)):
+        new_body["top_p"] = float(body["top_p"])
+
+    # 2. Extract string prompt input
+    if "input" in body and isinstance(body["input"], str):
+        new_body["input"] = body["input"]
+    else:
+        messages = body.get("messages", [])
+        if isinstance(messages, list) and len(messages) > 0:
             prompt_parts = []
             for m in messages:
-                role = m.get("role", "user")
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role", "user"))
                 content = m.get("content", "")
                 if isinstance(content, list):
-                    # Handle multimodal / content array
                     parts = []
                     for c in content:
                         if isinstance(c, dict) and c.get("type") == "text":
-                            parts.append(c.get("text", ""))
+                            parts.append(str(c.get("text", "")))
+                        elif isinstance(c, str):
+                            parts.append(c)
                     content = "\n".join(parts)
+                elif not isinstance(content, str):
+                    content = str(content)
+
                 prompt_parts.append(f"{role.capitalize()}: {content}")
 
             if len(messages) == 1 and messages[0].get("role") == "user":
@@ -265,7 +282,6 @@ def transform_request_body(body: dict) -> dict:
         else:
             new_body["input"] = ""
 
-    new_body.pop("messages", None)
     return new_body
 
 
@@ -275,6 +291,8 @@ def extract_text_from_copilot_json(data: dict) -> str:
         choice = data["choices"][0]
         if "message" in choice and isinstance(choice["message"], dict):
             return choice["message"].get("content", "")
+        if "delta" in choice and isinstance(choice["delta"], dict):
+            return choice["delta"].get("content", "")
         if "text" in choice:
             return choice.get("text", "")
 
@@ -299,7 +317,7 @@ def extract_text_from_copilot_json(data: dict) -> str:
     if "text" in data:
         return data["text"]
 
-    return str(data)
+    return ""
 
 
 def format_openai_completion_response(text: str) -> dict:
@@ -426,7 +444,6 @@ async def responses(
                     json=body,
                 ) as upstream:
 
-                    # One controlled retry on expired Copilot token.
                     if upstream.status_code == 401:
                         await upstream.aclose()
 
@@ -441,7 +458,12 @@ async def responses(
 
                             if retry.status_code >= 400:
                                 detail = await retry.aread()
-                                yield b"data: " + detail + b"\n\n"
+                                try:
+                                    err_json = json.loads(detail)
+                                    msg = err_json.get("error", {}).get("message") or str(err_json)
+                                except Exception:
+                                    msg = detail.decode("utf-8", errors="ignore")
+                                yield format_openai_chunk_sse(f"Error: {msg}", req_id)
                                 yield b"data: [DONE]\n\n"
                                 return
 
@@ -458,14 +480,20 @@ async def responses(
                                         if extracted:
                                             yield format_openai_chunk_sse(extracted, req_id)
                                     except json.JSONDecodeError:
-                                        yield format_openai_chunk_sse(payload_str, req_id)
+                                        if payload_str:
+                                            yield format_openai_chunk_sse(payload_str, req_id)
 
                             yield b"data: [DONE]\n\n"
                             return
 
                     if upstream.status_code >= 400:
                         detail = await upstream.aread()
-                        yield b"data: " + detail + b"\n\n"
+                        try:
+                            err_json = json.loads(detail)
+                            msg = err_json.get("error", {}).get("message") or str(err_json)
+                        except Exception:
+                            msg = detail.decode("utf-8", errors="ignore")
+                        yield format_openai_chunk_sse(f"Error: {msg}", req_id)
                         yield b"data: [DONE]\n\n"
                         return
 
@@ -482,7 +510,8 @@ async def responses(
                                 if extracted:
                                     yield format_openai_chunk_sse(extracted, req_id)
                             except json.JSONDecodeError:
-                                yield format_openai_chunk_sse(payload_str, req_id)
+                                if payload_str:
+                                    yield format_openai_chunk_sse(payload_str, req_id)
 
                     yield b"data: [DONE]\n\n"
 
