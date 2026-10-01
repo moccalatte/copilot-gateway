@@ -4,7 +4,7 @@ Copilot Gateway adalah reverse proxy API ringan berbasis FastAPI yang meneruskan
 
 Gateway ini menggunakan otentikasi **GitHub OAuth Device Flow**, sehingga Anda dapat menggunakan akun GitHub (seperti **GitHub Student Developer Pack** atau GitHub Copilot biasa) **tanpa perlu API Key Copilot berbayar**.
 
-Gateway ini siap dihubungkan sebagai **Custom Provider** pada platform gateway/router LLM seperti **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)**, baik secara lokal maupun diakses dari internet menggunakan **Cloudflare Tunnel**.
+Gateway ini siap dihubungkan sebagai **Custom Provider** pada platform gateway/router LLM seperti **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)**, baik secara lokal melalui **Custom Docker Network** maupun diakses dari internet menggunakan **Cloudflare Tunnel**.
 
 Repository Link: `github.com/moccalatte/copilot-gateway`
 
@@ -15,6 +15,7 @@ Repository Link: `github.com/moccalatte/copilot-gateway`
 - **Model Focus**: Khusus meneruskan request ke model **`gpt-5.4-nano`** GitHub Copilot.
 - **GitHub Student / OAuth Flow**: Cukup login dengan akun GitHub Copilot Anda via OAuth device code, tanpa memerlukan API key Copilot.
 - **Persistent Token Storage**: Token hasil OAuth tersimpan di direktori `./data/tokens.json` secara persisten (aman saat container direstart).
+- **Custom Docker Network**: Dilengkapi kustom jaringan Docker (`copilot-net`) agar container OmniRoute atau service lain dapat terhubung langsung antar-container.
 - **OmniRoute Compatible**: Kompatibel penuh dengan endpoint OpenAI (`/v1/chat/completions` dan `/v1/models`).
 - **Cloudflare Tunnel Friendly**: Panduan lengkap ekspos endpoint publik dengan SSL gratis via Cloudflare Tunnel (`https://copilot.domainkamu.com/v1`).
 - **Docker & Docker Compose Ready**: Dilengkapi Dockerfile dan docker-compose.yml yang mudah dijalankan.
@@ -64,7 +65,7 @@ DATA_DIR=data
 
 ---
 
-### Langkah 3: Jalankan Service dengan Docker Compose
+### Langkah 3: Jalankan Service dengan Docker Compose (Custom Network)
 
 Jalankan perintah berikut di dalam folder `copilot-gateway`:
 
@@ -72,7 +73,7 @@ Jalankan perintah berikut di dalam folder `copilot-gateway`:
 docker-compose up -d
 ```
 
-*Perintah di atas akan mendownload dan menjalankan Copilot Gateway secara background.*
+*Perintah di atas akan membuat kustom network `copilot-net`, mendownload, dan menjalankan Copilot Gateway secara background.*
 
 ---
 
@@ -99,9 +100,28 @@ Gateway memerlukan izin dari akun GitHub Anda satu kali saja:
 
 ---
 
+## 🌐 Panduan Custom Docker Network dengan OmniRoute
+
+Docker Compose di repository ini otomatis membuat kustom bridge network bernama **`copilot-net`**.
+
+Jika **OmniRoute** Anda dijalankan di dalam Docker di server yang sama, Anda cukup menghubungkan container OmniRoute Anda ke network `copilot-net` ini agar keduanya bisa saling berkomunikasi secara langsung tanpa perlu lewat IP publik.
+
+### Cara Menghubungkan Container OmniRoute ke Network `copilot-net`:
+
+Jalankan perintah berikut di terminal server Anda (ganti `omniroute` dengan nama container OmniRoute Anda):
+
+```bash
+docker network connect copilot-net omniroute
+```
+
+Setelah terhubung, OmniRoute dapat memanggil Copilot Gateway menggunakan hostname internal Docker:
+`http://copilot-gateway:8787/v1`
+
+---
+
 ## 🌐 Panduan Ekspos ke Internet via Cloudflare Tunnel (Opsional)
 
-Jika Anda ingin mengakses Gateway ini dari luar (misal dari VPS OmniRoute lain atau aplikasi external) menggunakan domain Anda sendiri (contoh: `https://copilot.domainkamu.com/v1`), gunakan **Cloudflare Tunnel**.
+Jika Anda ingin mengakses Gateway ini dari luar (misal dari VPS OmniRoute di server berbeda) menggunakan domain Anda sendiri (contoh: `https://copilot.domainkamu.com/v1`), gunakan **Cloudflare Tunnel**.
 
 ### A. Persiapan di Cloudflare Zero Trust Dashboard
 
@@ -109,56 +129,24 @@ Jika Anda ingin mengakses Gateway ini dari luar (misal dari VPS OmniRoute lain a
 2. Di menu sebelah kiri, pilih **Networks** -> **Tunnels**.
 3. Klik tombol **Add a tunnel** -> Pilih **Cloudflared** -> Klik **Next**.
 4. Beri nama tunnel Anda (contoh: `copilot-gateway-tunnel`) lalu klik **Save tunnel**.
-5. Pilih sistem operasi Anda (atau pilih **Docker**). Cloudflare akan memberikan token tunnel (string acak panjang). Simpan token ini.
+5. Pilih **Docker** untuk mendapatkan token tunnel. Simpan token ini.
 
 ### B. Menambahkan Public Hostname di Dashboard Cloudflare
 
-Masih di halaman konfigurasi tunnel Cloudflare:
 1. Klik tab **Public Hostname** -> klik **Add a public hostname**.
 2. Isi form konfigurasi:
-   - **Subdomain**: `copilot` (atau nama lain sesuai keinginan)
+   - **Subdomain**: `copilot` (atau nama lain)
    - **Domain**: Pilih domain Anda (misal: `domainkamu.com`)
-   - **Path**: Kosongkan (atau isi sesuai kebutuhan)
    - **Service Type**: `HTTP`
-   - **URL**: `copilot-gateway:8787` (jika cloudflared dipasang di network Docker yang sama) ATAU `localhost:8787` (jika cloudflared di-install langsung di OS host).
+   - **URL**: `copilot-gateway:8787`
 3. Klik **Save hostname**.
 
-### C. Menjalankan Cloudflared via Docker Compose (Metode Paling Mudah)
+### C. Menjalankan Cloudflared Container
 
-Anda dapat menambahkan service `cloudflared` langsung ke file `docker-compose.yml` di folder ini:
+Di file `docker-compose.yml`, service `cloudflared` sudah disiapkan pada network `copilot-net`. Isi variabel `CLOUDFLARE_TUNNEL_TOKEN` di `.env` Anda atau jalankan langsung:
 
-Buka `docker-compose.yml` dan sesuaikan menjadi:
-
-```yaml
-version: '3.8'
-
-services:
-  copilot-gateway:
-    build: .
-    container_name: copilot-gateway
-    restart: unless-stopped
-    ports:
-      - "8787:8787"
-    environment:
-      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Iv1.b507a08c87ecfe98}
-      - GATEWAY_API_KEY=${GATEWAY_API_KEY:-change-this-to-a-long-random-secret}
-      - HOST=0.0.0.0
-      - PORT=8787
-      - DATA_DIR=/app/data
-    volumes:
-      - ./data:/app/data
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: copilot-cloudflared
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run --token YOUR_CLOUDFLARE_TUNNEL_TOKEN_HERE
-```
-*(Ganti `YOUR_CLOUDFLARE_TUNNEL_TOKEN_HERE` dengan token dari dashboard Cloudflare).*
-
-Jalankan ulang Docker Compose:
 ```bash
-docker-compose up -d
+docker-compose --profile cloudflare up -d
 ```
 
 Sekarang Gateway Anda dapat diakses dari internet di tautan HTTPS yang aman:
@@ -176,10 +164,12 @@ Untuk menghubungkan Copilot Gateway ini ke **OmniRoute**:
 4. Isi form berikut:
    - **Provider Name**: `Copilot Gateway`
    - **Base URL**:
+     - Jika menggunakan Custom Docker Network (`copilot-net`):
+       `http://copilot-gateway:8787/v1`
      - Jika menggunakan Cloudflare Tunnel:
        `https://copilot.domainkamu.com/v1`
-     - Jika OmniRoute & Gateway di server/localhost yang sama:
-       `http://localhost:8787/v1` (atau `http://copilot-gateway:8787/v1` jika 1 Docker Network)
+     - Jika berjalan di Host/Localhost yang sama:
+       `http://localhost:8787/v1` (atau `http://host.docker.internal:8787/v1`)
    - **API Key**: Isi sesuai `GATEWAY_API_KEY` di file `.env` Anda (misal `kunci-rahasia-pilihan-anda-123`).
    - **Models**: Tambahkan model **`gpt-5.4-nano`**.
 5. Klik **Save / Submit**.
@@ -230,6 +220,7 @@ Untuk menghubungkan Copilot Gateway ini ke **OmniRoute**:
 | `PORT` | Bind Port server | `8787` |
 | `DATA_DIR` | Folder tempat penyimpanan file token OAuth | `data` |
 | `GITHUB_CLIENT_ID` | Client ID OAuth GitHub Device Code Flow | `Iv1.b507a08c87ecfe98` |
+| `CLOUDFLARE_TUNNEL_TOKEN` | Token Tunnel dari Cloudflare Zero Trust (Opsional) | `""` |
 
 ---
 
