@@ -1,10 +1,10 @@
 # Copilot Gateway (`gpt-5.4-nano`)
 
-Copilot Gateway adalah reverse proxy API ringan berbasis FastAPI yang Meneruskan permintaan OpenAI API ke GitHub Copilot API untuk mengakses model **`gpt-5.4-nano`**.
+Copilot Gateway adalah reverse proxy API ringan berbasis FastAPI yang meneruskan permintaan berformat OpenAI API ke GitHub Copilot API khusus untuk mengakses model **`gpt-5.4-nano`**.
 
 Gateway ini menggunakan otentikasi **GitHub OAuth Device Flow**, sehingga Anda dapat menggunakan akun GitHub (seperti **GitHub Student Developer Pack** atau GitHub Copilot biasa) **tanpa perlu API Key Copilot berbayar**.
 
-Gateway ini siap dihubungkan sebagai **Custom Provider** pada platform gateway/router LLM seperti **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)**.
+Gateway ini siap dihubungkan sebagai **Custom Provider** pada platform gateway/router LLM seperti **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)**, baik secara lokal maupun diakses dari internet menggunakan **Cloudflare Tunnel**.
 
 Repository Link: `github.com/moccalatte/copilot-gateway`
 
@@ -15,97 +15,183 @@ Repository Link: `github.com/moccalatte/copilot-gateway`
 - **Model Focus**: Khusus meneruskan request ke model **`gpt-5.4-nano`** GitHub Copilot.
 - **GitHub Student / OAuth Flow**: Cukup login dengan akun GitHub Copilot Anda via OAuth device code, tanpa memerlukan API key Copilot.
 - **Persistent Token Storage**: Token hasil OAuth tersimpan di direktori `./data/tokens.json` secara persisten (aman saat container direstart).
-- **OmniRoute Integration**: Kompatibel penuh dengan endpoint OpenAI (`/v1/chat/completions` dan `/v1/models`).
-- **Docker & Docker Compose Ready**: Dilengkapi Dockerfile dan docker-compose.yml.
-- **CORS Enabled**: Mendukung panggilan lintas origin dari frontend OmniRoute.
+- **OmniRoute Compatible**: Kompatibel penuh dengan endpoint OpenAI (`/v1/chat/completions` dan `/v1/models`).
+- **Cloudflare Tunnel Friendly**: Panduan lengkap ekspos endpoint publik dengan SSL gratis via Cloudflare Tunnel (`https://copilot.domainkamu.com/v1`).
+- **Docker & Docker Compose Ready**: Dilengkapi Dockerfile dan docker-compose.yml yang mudah dijalankan.
 
 ---
 
-## 🛠️ Persyaratan
+## 📋 Persyaratan Dasar
 
-- Akun GitHub dengan akses GitHub Copilot aktif (misal: **GitHub Student**).
-- **Docker & Docker Compose** (rekomendasi untuk deployment persisten) ATAU **Python 3.10+**.
+Sebelum memulai, pastikan Anda memiliki:
+1. Akun GitHub yang sudah memiliki akses **GitHub Copilot** (termasuk akun **GitHub Student Developer Pack**).
+2. Perangkat/Server (VPS / Laptop) yang terinstal:
+   - **Git**
+   - **Docker** dan **Docker Compose** *(Sangat direkomendasikan untuk pemula)*
 
 ---
 
-## ⚡ Cara Menjalankan dengan Docker (Rekomendasi)
+## 🔰 Panduan Langkah demi Langkah (Untuk Pemula)
 
-### 1. Jalankan Container
-Clone repo dan jalankan Docker Compose:
+### Langkah 1: Clone Repository ini
+
+Buka Terminal / Command Prompt / SSH VPS Anda, lalu jalankan perintah berikut:
+
+```bash
+git clone https://github.com/moccalatte/copilot-gateway.git
+cd copilot-gateway
+```
+
+---
+
+### Langkah 2: Konfigurasi File Environment `.env`
+
+Salin file contoh `env.example` menjadi `.env`:
+
+```bash
+cp env.example .env
+```
+
+Buka file `.env` (misal dengan `nano .env`) dan ubah `GATEWAY_API_KEY` menjadi kunci rahasia buatan Anda sendiri. Kunci ini nanti digunakan untuk mengamankan akses ke Gateway Anda:
+
+```env
+GITHUB_CLIENT_ID=Iv1.b507a08c87ecfe98
+GATEWAY_API_KEY=kunci-rahasia-pilihan-anda-123
+HOST=0.0.0.0
+PORT=8787
+DATA_DIR=data
+```
+
+---
+
+### Langkah 3: Jalankan Service dengan Docker Compose
+
+Jalankan perintah berikut di dalam folder `copilot-gateway`:
 
 ```bash
 docker-compose up -d
 ```
 
-### 2. Login dengan Akun GitHub Copilot / Student Anda
-Gateway memerlukan otentikasi OAuth satu kali ke akun GitHub Anda:
-
-```bash
-docker exec -it copilot-gateway python server.py login
-```
-
-Langkah login:
-1. Terminal akan menampilkan tautan verifikasi (misal: `https://github.com/login/device`) dan sebuah kode unik (misal: `ABCD-1234`).
-2. Buka tautan tersebut di browser, pastikan Anda masuk dengan akun GitHub Copilot (misal: akun GitHub Student Anda), lalu masukkan kodenya.
-3. Setelah mendapat konfirmasi "GitHub login OK.", token OAuth akan tersimpan secara otomatis di `./data/tokens.json`.
-4. Token tersimpan pada volume Docker persisten sehingga **tidak perlu login ulang** ketika container di-restart atau di-stop.
+*Perintah di atas akan mendownload dan menjalankan Copilot Gateway secara background.*
 
 ---
 
-## 🐍 Cara Menjalankan Lokal (Python Venv)
+### Langkah 4: Login dengan Akun GitHub Copilot / Student Anda
 
-### 1. Instalasi
+Gateway memerlukan izin dari akun GitHub Anda satu kali saja:
+
+1. Jalankan perintah login Docker:
+   ```bash
+   docker exec -it copilot-gateway python server.py login
+   ```
+
+2. Terminal akan menampilkan tautan verifikasi dan kode unik, contoh:
+   ```text
+   Open: https://github.com/login/device
+   Code: ABCD-1234
+   ```
+
+3. Buka browser Anda, kunjungi `https://github.com/login/device`, pastikan Anda sudah masuk (login) ke akun GitHub Copilot/Student Anda.
+4. Masukkan kode yang tertera di terminal (misal `ABCD-1234`) lalu klik **Authorize**.
+5. Setelah berhasil, di terminal akan muncul tulisan **`GitHub login OK.`**.
+
+*Token login Anda sekarang tersimpan aman di folder `./data/tokens.json`. Anda **tidak perlu login ulang** meskipun server atau Docker di-restart.*
+
+---
+
+## 🌐 Panduan Ekspos ke Internet via Cloudflare Tunnel (Opsional)
+
+Jika Anda ingin mengakses Gateway ini dari luar (misal dari VPS OmniRoute lain atau aplikasi external) menggunakan domain Anda sendiri (contoh: `https://copilot.domainkamu.com/v1`), gunakan **Cloudflare Tunnel**.
+
+### A. Persiapan di Cloudflare Zero Trust Dashboard
+
+1. Buka [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/).
+2. Di menu sebelah kiri, pilih **Networks** -> **Tunnels**.
+3. Klik tombol **Add a tunnel** -> Pilih **Cloudflared** -> Klik **Next**.
+4. Beri nama tunnel Anda (contoh: `copilot-gateway-tunnel`) lalu klik **Save tunnel**.
+5. Pilih sistem operasi Anda (atau pilih **Docker**). Cloudflare akan memberikan token tunnel (string acak panjang). Simpan token ini.
+
+### B. Menambahkan Public Hostname di Dashboard Cloudflare
+
+Masih di halaman konfigurasi tunnel Cloudflare:
+1. Klik tab **Public Hostname** -> klik **Add a public hostname**.
+2. Isi form konfigurasi:
+   - **Subdomain**: `copilot` (atau nama lain sesuai keinginan)
+   - **Domain**: Pilih domain Anda (misal: `domainkamu.com`)
+   - **Path**: Kosongkan (atau isi sesuai kebutuhan)
+   - **Service Type**: `HTTP`
+   - **URL**: `copilot-gateway:8787` (jika cloudflared dipasang di network Docker yang sama) ATAU `localhost:8787` (jika cloudflared di-install langsung di OS host).
+3. Klik **Save hostname**.
+
+### C. Menjalankan Cloudflared via Docker Compose (Metode Paling Mudah)
+
+Anda dapat menambahkan service `cloudflared` langsung ke file `docker-compose.yml` di folder ini:
+
+Buka `docker-compose.yml` dan sesuaikan menjadi:
+
+```yaml
+version: '3.8'
+
+services:
+  copilot-gateway:
+    build: .
+    container_name: copilot-gateway
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Iv1.b507a08c87ecfe98}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:-change-this-to-a-long-random-secret}
+      - HOST=0.0.0.0
+      - PORT=8787
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: copilot-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token YOUR_CLOUDFLARE_TUNNEL_TOKEN_HERE
+```
+*(Ganti `YOUR_CLOUDFLARE_TUNNEL_TOKEN_HERE` dengan token dari dashboard Cloudflare).*
+
+Jalankan ulang Docker Compose:
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate  # Linux / macOS
-# .venv\Scripts\activate   # Windows
-
-pip install -r requirements.txt
+docker-compose up -d
 ```
 
-### 2. Konfigurasi `.env` (Opsional)
-```bash
-cp env.example .env
-```
-Anda dapat menyesuaikan `GATEWAY_API_KEY` pada file `.env` sebagai Kunci Rahasia untuk mengakses Gateway ini.
-
-### 3. Login GitHub OAuth
-```bash
-python server.py login
-```
-
-### 4. Jalankan Server
-```bash
-python server.py
-```
-Server berjalan pada `http://localhost:8787`.
+Sekarang Gateway Anda dapat diakses dari internet di tautan HTTPS yang aman:
+`https://copilot.domainkamu.com/v1`
 
 ---
 
 ## 🔗 Panduan Hubungkan ke OmniRoute (github.com/diegosouzapw/OmniRoute)
 
-[OmniRoute](https://github.com/diegosouzapw/OmniRoute) dapat menggunakan Copilot Gateway ini sebagai Custom Provider:
+Untuk menghubungkan Copilot Gateway ini ke **OmniRoute**:
 
-1. Buka dashboard **OmniRoute** Anda.
-2. Navigasi ke **Providers** -> **Custom Providers** -> **Add Custom Provider**.
-3. Pilih Provider Type: **OpenAI Compatible**.
-4. Isi data konfigurasi berikut:
-   - **Provider Name**: `Copilot Gateway` (atau nama lain)
+1. Buka Dashboard **OmniRoute** Anda.
+2. Masuk ke menu **Providers** -> **Custom Providers** -> **Add Custom Provider**.
+3. Pilih tipe Provider: **OpenAI Compatible**.
+4. Isi form berikut:
+   - **Provider Name**: `Copilot Gateway`
    - **Base URL**:
-     - Jika OmniRoute & Copilot Gateway dalam 1 network Docker: `http://copilot-gateway:8787/v1`
-     - Jika berjalan di localhost server yang sama: `http://localhost:8787/v1` (atau `http://host.docker.internal:8787/v1`)
-   - **API Key**: Isi sesuai `GATEWAY_API_KEY` yang diatur pada file `.env` Gateway ini (default: `change-this-to-a-long-random-secret`).
-   - **Models**: Tambahkan model `gpt-5.4-nano`.
-5. Klik **Save**.
-6. Sekarang Anda dapat menggunakan model `gpt-5.4-nano` melalui OmniRoute!
+     - Jika menggunakan Cloudflare Tunnel:
+       `https://copilot.domainkamu.com/v1`
+     - Jika OmniRoute & Gateway di server/localhost yang sama:
+       `http://localhost:8787/v1` (atau `http://copilot-gateway:8787/v1` jika 1 Docker Network)
+   - **API Key**: Isi sesuai `GATEWAY_API_KEY` di file `.env` Anda (misal `kunci-rahasia-pilihan-anda-123`).
+   - **Models**: Tambahkan model **`gpt-5.4-nano`**.
+5. Klik **Save / Submit**.
+6. Selesai! Model `gpt-5.4-nano` sekarang siap digunakan melalui OmniRoute.
 
 ---
 
-## 📡 API Endpoints
+## 📡 API Endpoints Reference
 
 ### 1. Health Check
 - **GET** `/health`
-- **Response**:
+- Contoh Response:
   ```json
   {
     "ok": true,
@@ -117,42 +203,45 @@ Server berjalan pada `http://localhost:8787`.
 
 ### 2. List Models
 - **GET** `/v1/models`
-- **Header**: `Authorization: Bearer <GATEWAY_API_KEY>`
+- Header: `Authorization: Bearer <GATEWAY_API_KEY>`
 
 ### 3. Chat Completions
 - **POST** `/v1/chat/completions` atau `/v1/responses`
-- **Header**: `Authorization: Bearer <GATEWAY_API_KEY>`
-- **Example Request**:
+- Header: `Authorization: Bearer <GATEWAY_API_KEY>`
+- Contoh pengujian dengan `curl`:
   ```bash
-  curl http://localhost:8787/v1/chat/completions \
+  curl https://copilot.domainkamu.com/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer change-this-to-a-long-random-secret" \
+    -H "Authorization: Bearer kunci-rahasia-pilihan-anda-123" \
     -d '{
-      "messages": [{"role": "user", "content": "Halo gpt-5.4-nano!"}],
+      "messages": [{"role": "user", "content": "Halo, tes gpt-5.4-nano!"}],
       "stream": false
     }'
   ```
 
 ---
 
-## ⚙️ Environment Variables
+## ⚙️ Variabel Lingkungan (Environment Variables)
 
-| Variable | Description | Default |
+| Variable | Deskripsi | Default |
 | --- | --- | --- |
-| `GATEWAY_API_KEY` | Key rahasia untuk mengamankan akses ke Gateway | `change-this-to-a-long-random-secret` |
-| `HOST` | IP Host server | `0.0.0.0` |
-| `PORT` | Port server | `8787` |
-| `DATA_DIR` | Folder penyimpanan token OAuth | `data` |
-| `GITHUB_CLIENT_ID` | Client ID GitHub OAuth Device Flow | `Iv1.b507a08c87ecfe98` |
+| `GATEWAY_API_KEY` | Key rahasia pengaman akses API Gateway | `change-this-to-a-long-random-secret` |
+| `HOST` | Bind IP Host server | `0.0.0.0` |
+| `PORT` | Bind Port server | `8787` |
+| `DATA_DIR` | Folder tempat penyimpanan file token OAuth | `data` |
+| `GITHUB_CLIENT_ID` | Client ID OAuth GitHub Device Code Flow | `Iv1.b507a08c87ecfe98` |
 
 ---
 
-## 🧪 Testing
+## 🧪 Cara Pengujian Unit Test
 
-Jalankan test suite dengan pytest:
+Jika Anda ingin menjalankan pengujian internal:
 
 ```bash
-PYTHONPATH=. .venv/bin/pytest
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+PYTHONPATH=. pytest
 ```
 
 ---
