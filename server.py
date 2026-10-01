@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 
 import httpx
@@ -27,7 +28,6 @@ MODEL = "gpt-5.4-nano"
 GITHUB_DEVICE_URL = "https://github.com/login/device/code"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
-COPILOT_CHAT_COMPLETIONS_URL = "https://api.githubcopilot.com/chat/completions"
 COPILOT_RESPONSES_URL = "https://api.githubcopilot.com/responses"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -230,6 +230,122 @@ def copilot_headers(token):
 
 
 # ---------------------------------------------------------
+# Payload Transformation & Output Normalization
+# ---------------------------------------------------------
+
+def transform_request_body(body: dict) -> dict:
+    """Transform OpenAI format body to Copilot /responses API format."""
+    new_body = dict(body)
+    new_body["model"] = MODEL
+
+    if "input" not in new_body or not isinstance(new_body["input"], str):
+        messages = new_body.get("messages", [])
+        if messages and isinstance(messages, list):
+            prompt_parts = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    # Handle multimodal / content array
+                    parts = []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            parts.append(c.get("text", ""))
+                    content = "\n".join(parts)
+                prompt_parts.append(f"{role.capitalize()}: {content}")
+
+            if len(messages) == 1 and messages[0].get("role") == "user":
+                single_content = messages[0].get("content", "")
+                if isinstance(single_content, str):
+                    new_body["input"] = single_content
+                else:
+                    new_body["input"] = "\n".join(prompt_parts)
+            else:
+                new_body["input"] = "\n".join(prompt_parts)
+        else:
+            new_body["input"] = ""
+
+    new_body.pop("messages", None)
+    return new_body
+
+
+def extract_text_from_copilot_json(data: dict) -> str:
+    """Extract assistant response text from Copilot upstream JSON response."""
+    if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
+        choice = data["choices"][0]
+        if "message" in choice and isinstance(choice["message"], dict):
+            return choice["message"].get("content", "")
+        if "text" in choice:
+            return choice.get("text", "")
+
+    if "output" in data:
+        output = data["output"]
+        if isinstance(output, str):
+            return output
+        if isinstance(output, list):
+            texts = []
+            for item in output:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, dict):
+                    if "text" in item:
+                        texts.append(item["text"])
+                    elif "content" in item:
+                        texts.append(item["content"])
+            return "".join(texts)
+        if isinstance(output, dict):
+            return output.get("text") or output.get("content") or str(output)
+
+    if "text" in data:
+        return data["text"]
+
+    return str(data)
+
+
+def format_openai_completion_response(text: str) -> dict:
+    """Construct standard OpenAI chat completion JSON response."""
+    return {
+        "id": f"chatcmpl-{secrets.token_hex(12)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+def format_openai_chunk_sse(text: str, req_id: str) -> bytes:
+    """Format an SSE data line in standard OpenAI chat completion chunk format."""
+    chunk = {
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": None,
+            }
+        ],
+    }
+    return f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+
+
+# ---------------------------------------------------------
 # Health & Models
 # ---------------------------------------------------------
 
@@ -276,16 +392,8 @@ async def responses(
 ):
     authenticate(authorization)
 
-    body = await request.json()
-
-    # Single-purpose gateway for gpt-5.4-nano via GitHub OAuth / Copilot.
-    body["model"] = MODEL
-
-    # Determine upstream endpoint based on request path or payload keys
-    if request.url.path.endswith("/chat/completions") or "messages" in body:
-        upstream_url = COPILOT_CHAT_COMPLETIONS_URL
-    else:
-        upstream_url = COPILOT_RESPONSES_URL
+    raw_body = await request.json()
+    body = transform_request_body(raw_body)
 
     stream_mode = bool(body.get("stream", False))
 
@@ -306,12 +414,14 @@ async def responses(
         pool=15,
     )
 
+    req_id = f"chatcmpl-{secrets.token_hex(12)}"
+
     async def upstream_stream():
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 async with client.stream(
                     "POST",
-                    upstream_url,
+                    COPILOT_RESPONSES_URL,
                     headers=headers,
                     json=body,
                 ) as upstream:
@@ -324,36 +434,65 @@ async def responses(
 
                         async with client.stream(
                             "POST",
-                            upstream_url,
+                            COPILOT_RESPONSES_URL,
                             headers=copilot_headers(fresh_token),
                             json=body,
                         ) as retry:
 
                             if retry.status_code >= 400:
                                 detail = await retry.aread()
-                                yield detail
+                                yield b"data: " + detail + b"\n\n"
+                                yield b"data: [DONE]\n\n"
                                 return
 
-                            async for chunk in retry.aiter_bytes():
-                                yield chunk
+                            async for line in retry.aiter_lines():
+                                if not line:
+                                    continue
+                                if line.startswith("data: "):
+                                    payload_str = line[6:].strip()
+                                    if payload_str == "[DONE]":
+                                        break
+                                    try:
+                                        payload = json.loads(payload_str)
+                                        extracted = extract_text_from_copilot_json(payload)
+                                        if extracted:
+                                            yield format_openai_chunk_sse(extracted, req_id)
+                                    except json.JSONDecodeError:
+                                        yield format_openai_chunk_sse(payload_str, req_id)
 
-                        return
+                            yield b"data: [DONE]\n\n"
+                            return
 
                     if upstream.status_code >= 400:
                         detail = await upstream.aread()
-                        yield detail
+                        yield b"data: " + detail + b"\n\n"
+                        yield b"data: [DONE]\n\n"
                         return
 
-                    async for chunk in upstream.aiter_bytes():
-                        yield chunk
+                    async for line in upstream.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            payload_str = line[6:].strip()
+                            if payload_str == "[DONE]":
+                                break
+                            try:
+                                payload = json.loads(payload_str)
+                                extracted = extract_text_from_copilot_json(payload)
+                                if extracted:
+                                    yield format_openai_chunk_sse(extracted, req_id)
+                            except json.JSONDecodeError:
+                                yield format_openai_chunk_sse(payload_str, req_id)
+
+                    yield b"data: [DONE]\n\n"
 
             except httpx.TimeoutException:
-                yield b'{"error":{"message":"Upstream timeout"}}'
+                yield format_openai_chunk_sse("[Upstream timeout]", req_id)
+                yield b"data: [DONE]\n\n"
 
             except httpx.HTTPError:
-                yield (
-                    b'{"error":{"message":"Upstream connection error"}}'
-                )
+                yield format_openai_chunk_sse("[Upstream connection error]", req_id)
+                yield b"data: [DONE]\n\n"
 
     if stream_mode:
         return StreamingResponse(
@@ -372,7 +511,7 @@ async def responses(
 
         try:
             r = await client.post(
-                upstream_url,
+                COPILOT_RESPONSES_URL,
                 headers=headers,
                 json=body,
             )
@@ -381,23 +520,31 @@ async def responses(
                 fresh_token = await get_copilot_token()
 
                 r = await client.post(
-                    upstream_url,
+                    COPILOT_RESPONSES_URL,
                     headers=copilot_headers(fresh_token),
                     json=body,
                 )
 
+            if r.status_code >= 400:
+                try:
+                    err_content = r.json()
+                except ValueError:
+                    err_content = {"error": {"message": r.text}}
+                return JSONResponse(
+                    content=err_content,
+                    status_code=r.status_code,
+                )
+
             try:
-                content = r.json()
+                raw_json = r.json()
+                text = extract_text_from_copilot_json(raw_json)
+                response_json = format_openai_completion_response(text)
             except ValueError:
-                content = {
-                    "error": {
-                        "message": "Invalid upstream response"
-                    }
-                }
+                response_json = format_openai_completion_response(r.text)
 
             return JSONResponse(
-                content=content,
-                status_code=r.status_code,
+                content=response_json,
+                status_code=200,
             )
 
         except httpx.TimeoutException:

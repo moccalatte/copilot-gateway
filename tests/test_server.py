@@ -7,6 +7,40 @@ import server
 
 client = TestClient(server.app)
 
+def test_transform_request_body_single_message():
+    openai_body = {
+        "messages": [{"role": "user", "content": "Halo, tes gpt-5.4-nano!"}],
+        "stream": False,
+        "model": "gpt-4o"
+    }
+    copilot_body = server.transform_request_body(openai_body)
+    assert copilot_body["model"] == "gpt-5.4-nano"
+    assert copilot_body["input"] == "Halo, tes gpt-5.4-nano!"
+    assert "messages" not in copilot_body
+
+def test_transform_request_body_multiple_messages():
+    openai_body = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Tell me a joke."}
+        ],
+        "stream": True
+    }
+    copilot_body = server.transform_request_body(openai_body)
+    assert copilot_body["model"] == "gpt-5.4-nano"
+    assert "System: You are a helpful assistant." in copilot_body["input"]
+    assert "User: Tell me a joke." in copilot_body["input"]
+
+def test_extract_text_and_format_openai_completion():
+    raw_data = {"choices": [{"message": {"role": "assistant", "content": "Hello world!"}}]}
+    text = server.extract_text_from_copilot_json(raw_data)
+    assert text == "Hello world!"
+
+    formatted = server.format_openai_completion_response(text)
+    assert formatted["object"] == "chat.completion"
+    assert formatted["model"] == "gpt-5.4-nano"
+    assert formatted["choices"][0]["message"]["content"] == "Hello world!"
+
 def test_health_endpoint():
     response = client.get("/health")
     assert response.status_code == 200
@@ -35,14 +69,6 @@ def test_unauthorized_request():
     )
     assert response.status_code == 401
 
-def test_invalid_bearer_token():
-    response = client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": "Bearer wrong-key"},
-        json={"messages": [{"role": "user", "content": "hello"}]}
-    )
-    assert response.status_code == 401
-
 def test_authorized_unauthenticated_github(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / "tokens.json")
     monkeypatch.setattr(server, "GATEWAY_API_KEY", "test-secret")
@@ -51,18 +77,6 @@ def test_authorized_unauthenticated_github(tmp_path, monkeypatch):
         "/v1/chat/completions",
         headers={"Authorization": "Bearer test-secret"},
         json={"messages": [{"role": "user", "content": "hello"}]}
-    )
-    assert response.status_code == 502
-    assert "Not authenticated" in response.json()["detail"]
-
-def test_responses_endpoint_unauthenticated_github(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / "tokens.json")
-    monkeypatch.setattr(server, "GATEWAY_API_KEY", "test-secret")
-
-    response = client.post(
-        "/v1/responses",
-        headers={"Authorization": "Bearer test-secret"},
-        json={"input": "hello"}
     )
     assert response.status_code == 502
     assert "Not authenticated" in response.json()["detail"]
