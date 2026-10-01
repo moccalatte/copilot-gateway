@@ -43,6 +43,8 @@ git clone https://github.com/moccalatte/copilot-gateway.git
 cd copilot-gateway
 ```
 
+*(Jika Anda sudah pernah clone sebelumnya dan ingin memperbarui ke versi terbaru, jalankan `git pull` di folder `copilot-gateway`).*
+
 ---
 
 ### Langkah 2: Buat External Docker Network (`copilot-net`)
@@ -75,15 +77,14 @@ DATA_DIR=data
 
 ---
 
-### Langkah 4: Jalankan Service dengan Docker Compose
+### Langkah 4: Build dan Jalankan Service dengan Docker Compose
 
 Jalankan perintah berikut di dalam folder `copilot-gateway`:
 
 ```bash
+docker-compose build --no-cache
 docker-compose up -d
 ```
-
-*Perintah di atas akan mendownload dan menjalankan Copilot Gateway secara background di dalam jaringan `copilot-net`.*
 
 ---
 
@@ -107,6 +108,18 @@ Gateway memerlukan izin dari akun GitHub Anda satu kali saja:
 5. Setelah berhasil, di terminal akan muncul tulisan **`GitHub login OK.`**.
 
 *Token login Anda sekarang tersimpan aman di folder `./data/tokens.json`. Anda **tidak perlu login ulang** meskipun server atau Docker di-restart.*
+
+---
+
+## 🔄 Cara Update/Restart Container Saat Ada Perubahan Kode
+
+Jika Anda melakukan update kode dari repository atau mengubah konfigurasi server, rebuild dan restart container Anda dengan perintah berikut:
+
+```bash
+git pull
+docker-compose build --no-cache
+docker-compose up -d
+```
 
 ---
 
