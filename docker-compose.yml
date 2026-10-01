@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  copilot-gateway:
+    build: .
+    container_name: copilot-gateway
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Iv1.b507a08c87ecfe98}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:-change-this-to-a-long-random-secret}
+      - HOST=0.0.0.0
+      - PORT=8787
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
