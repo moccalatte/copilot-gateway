@@ -54,3 +54,15 @@ def test_authorized_unauthenticated_github(tmp_path, monkeypatch):
     )
     assert response.status_code == 502
     assert "Not authenticated" in response.json()["detail"]
+
+def test_responses_endpoint_unauthenticated_github(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / "tokens.json")
+    monkeypatch.setattr(server, "GATEWAY_API_KEY", "test-secret")
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": "Bearer test-secret"},
+        json={"input": "hello"}
+    )
+    assert response.status_code == 502
+    assert "Not authenticated" in response.json()["detail"]

@@ -27,6 +27,7 @@ MODEL = "gpt-5.4-nano"
 GITHUB_DEVICE_URL = "https://github.com/login/device/code"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
+COPILOT_CHAT_COMPLETIONS_URL = "https://api.githubcopilot.com/chat/completions"
 COPILOT_RESPONSES_URL = "https://api.githubcopilot.com/responses"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -280,6 +281,12 @@ async def responses(
     # Single-purpose gateway for gpt-5.4-nano via GitHub OAuth / Copilot.
     body["model"] = MODEL
 
+    # Determine upstream endpoint based on request path or payload keys
+    if request.url.path.endswith("/chat/completions") or "messages" in body:
+        upstream_url = COPILOT_CHAT_COMPLETIONS_URL
+    else:
+        upstream_url = COPILOT_RESPONSES_URL
+
     stream_mode = bool(body.get("stream", False))
 
     try:
@@ -304,7 +311,7 @@ async def responses(
             try:
                 async with client.stream(
                     "POST",
-                    COPILOT_RESPONSES_URL,
+                    upstream_url,
                     headers=headers,
                     json=body,
                 ) as upstream:
@@ -317,7 +324,7 @@ async def responses(
 
                         async with client.stream(
                             "POST",
-                            COPILOT_RESPONSES_URL,
+                            upstream_url,
                             headers=copilot_headers(fresh_token),
                             json=body,
                         ) as retry:
@@ -365,7 +372,7 @@ async def responses(
 
         try:
             r = await client.post(
-                COPILOT_RESPONSES_URL,
+                upstream_url,
                 headers=headers,
                 json=body,
             )
@@ -374,7 +381,7 @@ async def responses(
                 fresh_token = await get_copilot_token()
 
                 r = await client.post(
-                    COPILOT_RESPONSES_URL,
+                    upstream_url,
                     headers=copilot_headers(fresh_token),
                     json=body,
                 )
