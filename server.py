@@ -136,50 +136,71 @@ async def device_login():
 
 
 # ---------------------------------------------------------
-# Copilot token
+# Copilot token (cached: upstream tokens live ~30 min, so
+# refetching on every request just hammers GitHub and
+# causes intermittent 502s under load)
 # ---------------------------------------------------------
 
-async def get_copilot_token():
-    tokens = load_tokens()
+COPILOT_TOKEN_TTL = 25 * 60  # refresh 5 min before typical 30 min expiry
 
-    github_token = tokens.get("github_access_token")
+_token_cache = {"token": None, "fetched_at": 0.0}
+_token_lock = asyncio.Lock()
 
-    if not github_token:
-        raise RuntimeError(
-            "Not authenticated. Run: python server.py login"
-        )
 
-    async with httpx.AsyncClient(
-        timeout=CONNECT_TIMEOUT
-    ) as client:
+async def get_copilot_token(force_refresh: bool = False) -> str:
+    async with _token_lock:
+        now = time.time()
 
-        r = await client.get(
-            COPILOT_TOKEN_URL,
-            headers={
-                "Authorization": f"token {github_token}",
-                "Accept": "application/json",
-                "User-Agent": "Copilot-Gateway",
-            },
-        )
+        if (
+            not force_refresh
+            and _token_cache["token"]
+            and now - _token_cache["fetched_at"] < COPILOT_TOKEN_TTL
+        ):
+            return _token_cache["token"]
 
-        if r.status_code == 401:
+        tokens = load_tokens()
+
+        github_token = tokens.get("github_access_token")
+
+        if not github_token:
             raise RuntimeError(
-                "GitHub authentication expired. "
-                "Run: python server.py login"
+                "Not authenticated. Run: python server.py login"
             )
 
-        r.raise_for_status()
+        async with httpx.AsyncClient(
+            timeout=CONNECT_TIMEOUT
+        ) as client:
 
-        data = r.json()
-
-        token = data.get("token")
-
-        if not token:
-            raise RuntimeError(
-                "GitHub did not return a Copilot token."
+            r = await client.get(
+                COPILOT_TOKEN_URL,
+                headers={
+                    "Authorization": f"token {github_token}",
+                    "Accept": "application/json",
+                    "User-Agent": "Copilot-Gateway",
+                },
             )
 
-        return token
+            if r.status_code == 401:
+                raise RuntimeError(
+                    "GitHub authentication expired. "
+                    "Run: python server.py login"
+                )
+
+            r.raise_for_status()
+
+            data = r.json()
+
+            token = data.get("token")
+
+            if not token:
+                raise RuntimeError(
+                    "GitHub did not return a Copilot token."
+                )
+
+            _token_cache["token"] = token
+            _token_cache["fetched_at"] = now
+
+            return token
 
 
 # ---------------------------------------------------------
@@ -233,8 +254,40 @@ def copilot_headers(token):
 # Payload Transformation & Output Normalization
 # ---------------------------------------------------------
 
+def _msg_text(content) -> str:
+    """Flatten an OpenAI message content (string or parts list) to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(str(c.get("text", "")))
+            elif isinstance(c, str):
+                parts.append(c)
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
 def transform_request_body(body: dict) -> dict:
-    """Transform OpenAI format body to Copilot /responses API format."""
+    """Transform OpenAI chat-completions format to Copilot /responses format.
+
+    The conversation is mapped 1:1, IN ORDER, to Responses API input items:
+
+      - user / developer / system message  -> {"role", "content"} item
+      - assistant message (text)           -> {"role": "assistant", "content"} item
+      - assistant message (tool_calls)     -> one function_call item per call
+      - tool message                       -> function_call_output item
+
+    The previous implementation collapsed the entire history into ONE flat
+    text prompt and appended ALL function calls after it. That reversed the
+    temporal order (the latest user prompt sat inside item 0 while dozens of
+    stale function_call items followed), which made the model answer old
+    topics in loops, and duplicated the whole history (text + tool items),
+    inflating token usage per request.
+    """
     new_body = {}
 
     # 1. Model & Parameters
@@ -246,7 +299,7 @@ def transform_request_body(body: dict) -> dict:
     if "top_p" in body and isinstance(body["top_p"], (int, float)):
         new_body["top_p"] = float(body["top_p"])
 
-    # 1b. Pass tool-calling through. Harnesses send OpenAI chat-completions
+    # 1b. Tool-calling passthrough. Harnesses send OpenAI chat-completions
     # style tools ({"type":"function","function":{...}}) but the upstream
     # /responses API requires the flat Responses format
     # ({"type":"function","name":...}) and rejects the nested one with 400.
@@ -266,75 +319,83 @@ def transform_request_body(body: dict) -> dict:
     if body.get("tool_choice") is not None:
         new_body["tool_choice"] = body["tool_choice"]
 
-    # 2. Extract string prompt input
+    # 2. Build input
     if "input" in body and isinstance(body["input"], str):
         new_body["input"] = body["input"]
-    else:
-        messages = body.get("messages", [])
-        if isinstance(messages, list) and len(messages) > 0:
-            prompt_parts = []
-            input_items = []  # Responses API items (function_call(+_output))
-            for m in messages:
-                if not isinstance(m, dict):
-                    continue
-                role = str(m.get("role", "user"))
+        return new_body
 
-                if role == "tool":
-                    input_items.append({
-                        "type": "function_call_output",
-                        "call_id": m.get("tool_call_id", ""),
-                        "output": m.get("content") if isinstance(m.get("content"), str) else str(m.get("content", "")),
+    messages = body.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        new_body["input"] = ""
+        return new_body
+
+    items = []
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "user"))
+
+        if role == "tool":
+            out = m.get("content")
+            items.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id", ""),
+                "output": out if isinstance(out, str) else json.dumps(out) if out is not None else "",
+            })
+            continue
+
+        if role == "assistant":
+            tool_calls = m.get("tool_calls")
+            text = _msg_text(m.get("content"))
+
+            # Emit the assistant's own text first (if any), preserving order.
+            if text:
+                items.append({
+                    "role": "assistant",
+                    "content": text,
+                })
+
+            # Then each tool call, so a following tool result binds to it.
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    items.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id") or f"call_{secrets.token_hex(8)}",
+                        "name": fn.get("name", ""),
+                        "arguments": args if isinstance(args, str) else json.dumps(args or {}),
                     })
-                    continue
+            continue
 
-                content = m.get("content", "")
-                if isinstance(content, list):
-                    parts = []
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") == "text":
-                            parts.append(str(c.get("text", "")))
-                        elif isinstance(c, str):
-                            parts.append(c)
-                    content = "\n".join(parts)
-                elif not isinstance(content, str):
-                    content = str(content)
-
-                if role == "assistant" and isinstance(m.get("tool_calls"), list) and m["tool_calls"]:
-                    # Re-create the function_call items so upstream can bind
-                    # each following tool result to its call by id.
-                    for tc in m["tool_calls"]:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function") or {}
-                            args = fn.get("arguments")
-                            input_items.append({
-                                "type": "function_call",
-                                "call_id": tc.get("id") or f"call_{secrets.token_hex(8)}",
-                                "name": fn.get("name", ""),
-                                "arguments": args if isinstance(args, str) else json.dumps(args or {}),
-                            })
-                    continue
-
-                prompt_parts.append(f"{role.capitalize()}: {content}")
-
-            if input_items:
-                # Multi-turn tool conversation: rebuild a Responses API input
-                # list so results bind back to their function calls by id.
-                # Preceding context (system/user turns) goes as a plain text
-                # item first so the model keeps the original instruction.
-                prior = "\n".join(prompt_parts).strip()
-                if prior:
-                    input_items.insert(0, {"role": "user", "content": prior})
-                new_body["input"] = input_items
-            elif len(messages) == 1 and messages[0].get("role") == "user":
-                single_content = messages[0].get("content", "")
-                if isinstance(single_content, str):
-                    new_body["input"] = single_content
-                else:
-                    new_body["input"] = "\n".join(prompt_parts)
-            else:
-                new_body["input"] = "\n".join(prompt_parts)
+        # user / developer / system
+        text = _msg_text(m.get("content"))
+        if not text:
+            continue
+        # Responses API has no developer/system input role: fold instructions
+        # into the user item, prefixed so their provenance stays visible.
+        if role in ("developer", "system"):
+            items.append({
+                "role": "user",
+                "content": f"[{role.capitalize()} instructions]\n{text}",
+            })
         else:
-            new_body["input"] = ""
+            items.append({"role": "user", "content": text})
+
+    if not items:
+        new_body["input"] = ""
+        return new_body
+
+    # The upstream /responses endpoint accepts either a plain string or a
+    # list of items. A single plain user message stays a string (simplest
+    # form); anything else goes through as the ordered item list.
+    if len(items) == 1 and isinstance(items[0], dict) and items[0].get("role") == "user":
+        new_body["input"] = items[0]["content"]
+    else:
+        new_body["input"] = items
 
     return new_body
 
@@ -691,7 +752,9 @@ async def responses(
                     if upstream.status_code == 401:
                         await upstream.aclose()
 
-                        fresh_token = await get_copilot_token()
+                        fresh_token = await get_copilot_token(
+                            force_refresh=True
+                        )
 
                         async with client.stream(
                             "POST",
@@ -800,7 +863,9 @@ async def responses(
             )
 
             if r.status_code == 401:
-                fresh_token = await get_copilot_token()
+                fresh_token = await get_copilot_token(
+                    force_refresh=True
+                )
 
                 r = await client.post(
                     COPILOT_RESPONSES_URL,
