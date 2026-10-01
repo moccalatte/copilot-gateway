@@ -18,16 +18,6 @@ services:
     networks:
       - copilot-net
 
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: copilot-cloudflared
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-YOUR_CLOUDFLARE_TUNNEL_TOKEN_HERE}
-    networks:
-      - copilot-net
-    profiles:
-      - cloudflare
-
 networks:
   copilot-net:
     name: copilot-net
