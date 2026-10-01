@@ -285,37 +285,134 @@ def transform_request_body(body: dict) -> dict:
     return new_body
 
 
-def extract_text_from_copilot_json(data: dict) -> str:
-    """Extract assistant response text from Copilot upstream JSON response."""
-    if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
-        choice = data["choices"][0]
-        if "message" in choice and isinstance(choice["message"], dict):
-            return choice["message"].get("content", "")
-        if "delta" in choice and isinstance(choice["delta"], dict):
-            return choice["delta"].get("content", "")
-        if "text" in choice:
-            return choice.get("text", "")
+def _content_parts_to_text(content) -> str:
+    """Flatten Responses API content (string or list of parts) to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict):
+                if isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+                elif "content" in part:
+                    texts.append(_content_parts_to_text(part["content"]))
+        return "".join(texts)
+    if isinstance(content, dict):
+        inner = content.get("text")
+        if isinstance(inner, str):
+            return inner
+        if "content" in content:
+            return _content_parts_to_text(content["content"])
+        return ""
+    if content is None:
+        return ""
+    return str(content)
 
-    if "output" in data:
-        output = data["output"]
-        if isinstance(output, str):
-            return output
-        if isinstance(output, list):
-            texts = []
-            for item in output:
-                if isinstance(item, str):
-                    texts.append(item)
-                elif isinstance(item, dict):
-                    if "text" in item:
-                        texts.append(item["text"])
-                    elif "content" in item:
-                        texts.append(item["content"])
-            return "".join(texts)
-        if isinstance(output, dict):
-            return output.get("text") or output.get("content") or str(output)
+
+def extract_text_from_copilot_json(data: dict) -> str:
+    """Extract assistant response text from Copilot upstream JSON response.
+
+    The upstream /responses endpoint returns OpenAI Responses API format:
+    ``output`` is a list of items (message / reasoning / tool calls) whose
+    ``content`` is itself a list of parts (e.g. ``output_text``). It may
+    also return plain chat-completions format, so both are handled.
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    # Chat-completions style.
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            message = choice.get("message")
+            if isinstance(message, dict):
+                return _content_parts_to_text(message.get("content"))
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                return _content_parts_to_text(delta.get("content"))
+            if "text" in choice:
+                return _content_parts_to_text(choice.get("text"))
+
+    # Responses API style: concatenate text across output items,
+    # skipping reasoning items (their summaries are not the answer).
+    output = data.get("output")
+    if isinstance(output, list):
+        texts = []
+        for item in output:
+            if isinstance(item, str):
+                texts.append(item)
+                continue
+            if isinstance(item, dict):
+                if item.get("type") == "reasoning":
+                    continue
+                texts.append(_content_parts_to_text(item.get("content")))
+        return "".join(texts)
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        return _content_parts_to_text(output)
 
     if "text" in data:
-        return data["text"]
+        return _content_parts_to_text(data["text"])
+
+    return ""
+
+
+def extract_delta_from_copilot_json(data: dict) -> str:
+    """Extract incremental text from one upstream SSE JSON payload.
+
+    Handles both Responses API events (response.output_text.delta etc.)
+    and chat-completions chunks. Events that carry the complete response
+    (response.completed / response.done) return "" so the full text is
+    not emitted a second time after the deltas.
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    event_type = data.get("type")
+
+    if event_type:
+        if event_type == "response.output_text.delta":
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                return delta
+            return _content_parts_to_text(delta)
+
+        if event_type in ("response.output_text.done", "response.completed", "response.done"):
+            # Full text already streamed via deltas — do not re-emit.
+            return ""
+
+        if event_type == "response.failed":
+            response = data.get("response") or {}
+            error = response.get("error") or {}
+            msg = error.get("message") if isinstance(error, dict) else str(error)
+            return f"Error: {msg or 'unknown upstream error'}"
+
+        if event_type == "error":
+            err = data.get("error")
+            msg = data.get("message") or (
+                err.get("message") if isinstance(err, dict) else None
+            )
+            return f"Error: {msg or 'unknown upstream error'}"
+
+        # Unknown/ignorable event types (response.created,
+        # response.in_progress, response.content_part.added, ...).
+        return ""
+
+    # Chat-completions style chunk.
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                return _content_parts_to_text(delta.get("content"))
+            if "text" in choice:
+                return _content_parts_to_text(choice.get("text"))
 
     return ""
 
@@ -476,7 +573,7 @@ async def responses(
                                         break
                                     try:
                                         payload = json.loads(payload_str)
-                                        extracted = extract_text_from_copilot_json(payload)
+                                        extracted = extract_delta_from_copilot_json(payload)
                                         if extracted:
                                             yield format_openai_chunk_sse(extracted, req_id)
                                     except json.JSONDecodeError:
@@ -506,7 +603,7 @@ async def responses(
                                 break
                             try:
                                 payload = json.loads(payload_str)
-                                extracted = extract_text_from_copilot_json(payload)
+                                extracted = extract_delta_from_copilot_json(payload)
                                 if extracted:
                                     yield format_openai_chunk_sse(extracted, req_id)
                             except json.JSONDecodeError:

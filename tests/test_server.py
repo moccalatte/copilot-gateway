@@ -80,3 +80,58 @@ def test_authorized_unauthenticated_github(tmp_path, monkeypatch):
     )
     assert response.status_code == 502
     assert "Not authenticated" in response.json()["detail"]
+
+def test_extract_text_responses_api_shape():
+    # Actual upstream /responses shape: output[].content[] is a list of parts
+    raw = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "annotations": [],
+                        "logprobs": [],
+                        "text": "PING-TEST-OK",
+                        "type": "output_text",
+                    }
+                ],
+            }
+        ],
+        "output_text": None,
+    }
+    assert server.extract_text_from_copilot_json(raw) == "PING-TEST-OK"
+
+def test_extract_text_output_item_content_string():
+    raw = {"output": [{"type": "message", "content": "hello"}]}
+    assert server.extract_text_from_copilot_json(raw) == "hello"
+
+def test_extract_text_skips_reasoning_items():
+    raw = {
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "content": [{"type": "output_text", "text": "answer"}]},
+        ]
+    }
+    assert server.extract_text_from_copilot_json(raw) == "answer"
+
+def test_extract_delta_responses_api_events():
+    assert server.extract_delta_from_copilot_json(
+        {"type": "response.output_text.delta", "delta": "Hi"}
+    ) == "Hi"
+    # Non-delta Responses events must yield nothing (esp. response.completed,
+    # which carries the FULL text again — yielding it would duplicate output)
+    assert server.extract_delta_from_copilot_json({"type": "response.created"}) == ""
+    full = {
+        "type": "response.completed",
+        "response": {"output": [{"content": [{"type": "output_text", "text": "full"}]}]},
+    }
+    assert server.extract_delta_from_copilot_json(full) == ""
+    assert server.extract_delta_from_copilot_json(
+        {"type": "response.failed", "response": {"error": {"message": "boom"}}}
+    ) == "Error: boom"
+
+def test_extract_delta_chat_chunk():
+    chunk = {"choices": [{"index": 0, "delta": {"content": "abc"}, "finish_reason": None}]}
+    assert server.extract_delta_from_copilot_json(chunk) == "abc"
